@@ -29,9 +29,10 @@ from pyrogram.enums import ParseMode
 from render_api import RenderAPI
 
 # -------- CONFIG --------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH")
+
+BOT_TOKEN = "8298721017:AAHquRSfWT5fk9DnN0clpH84jT6UTjeoBmc"
+API_ID = 23907288
+API_HASH = "f9a47570ed19aebf8eb0f0a5ec1111e5"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 # ------------------------
 
