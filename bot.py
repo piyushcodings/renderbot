@@ -1,17 +1,16 @@
 # bot.py
 """
-Render Manager Bot (Pyrogram)
-Full-featured manager with inline keyboards.
+Render Manager Bot (Pyrogram) - fixed and extended
 
 Features:
 - /start, /login <RENDER_API_KEY>
 - Inline menu with account, list apps
 - Per-service menu: Status, Restart, Delete, Logs, Env Vars, Set Repo, Deploy
-- Deploy trigger, list deploys
-- Env management (list, add/update, delete)
-- Set repo (repo | branch)
-- Persist api keys and repo mapping in state.json
-- Robust parse_mode handling for Pyrogram v2 using pyrogram.enums.ParseMode
+- Trigger deploys (fixed invalid JSON bug)
+- Logs via /v1/logs (fixed 404)
+- Create service (basic wrapper) and show service URL if available
+- Robust parse_mode handling using pyrogram.enums.ParseMode and safe fallbacks
+- state.json persistence for API keys and repo mapping
 """
 
 import os
@@ -24,25 +23,25 @@ from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from pyrogram.enums import ParseMode
 
-from render_api import RenderAPI  # ensure render_api.py (wrapper) is present
+from render_api import RenderAPI
 
 # ---------------- CONFIG ----------------
-# IMPORTANT: Do NOT hardcode tokens in production. Use environment variables.
 BOT_TOKEN = "8298721017:AAHquRSfWT5fk9DnN0clpH84jT6UTjeoBmc"
 API_ID = 23907288
 API_HASH = "f9a47570ed19aebf8eb0f0a5ec1111e5"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+OWNER_ID = 1365883451
 # ----------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if not BOT_TOKEN or not API_ID or not API_HASH:
-    logger.warning("BOT_TOKEN / API_ID / API_HASH not set. Make sure to provide them as environment variables.")
+    logger.warning("Make sure BOT_TOKEN, API_ID, API_HASH are set as environment variables")
 
 app = Client("render_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# state: {"api_keys": {user_id: key}, "repos": {service_id: {"repo": "...", "branch": "..."}}}
+# load state
 if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -52,7 +51,6 @@ if os.path.exists(STATE_FILE):
 else:
     state = {"api_keys": {}, "repos": {}}
 
-# pending actions used for one-shot text replies (env add/delete, set repo)
 pending_actions: Dict[str, Dict[str, Any]] = {}  # keyed by str(user_id)
 
 # ---------------- state helpers ----------------
@@ -70,12 +68,7 @@ def api_for(user_id: int) -> Optional[RenderAPI]:
     return RenderAPI(key)
 
 # ---------------- Safe messaging helpers ----------------
-# Use ParseMode enum throughout. Fallback to plain text if parse fails.
 async def safe_edit(msg_obj: Message, text: str, reply_markup=None, parse_mode=ParseMode.HTML):
-    """
-    Try to edit message. If MessageNotModified ignore.
-    If entity/parse problems occur, attempt fallback (reply without parse mode).
-    """
     try:
         await msg_obj.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
@@ -84,22 +77,18 @@ async def safe_edit(msg_obj: Message, text: str, reply_markup=None, parse_mode=P
     except errors.RPCError as e:
         msg = str(e)
         logger.debug("safe_edit RPCError: %s", msg)
-        # If parse mode or entity issues, fallback to reply_text without parse_mode
+        # if parse issues or entity bounds invalid, fallback to reply_text plain
         if "ENTITY_BOUNDS_INVALID" in msg or "Invalid parse mode" in msg or "entities" in msg:
             try:
                 await msg_obj.reply_text(text, reply_markup=reply_markup)
                 return
             except Exception:
                 logger.exception("Fallback reply_text in safe_edit failed")
-        # otherwise re-raise or log
         logger.exception("Unexpected RPCError in safe_edit: %s", e)
     except Exception:
         logger.exception("Unexpected error in safe_edit")
 
 async def safe_reply(msg_obj: Message, text: str, reply_markup=None, parse_mode=ParseMode.HTML):
-    """
-    Try reply_text with parse_mode; if RPC parse errors happen fallback to plain reply_text.
-    """
     try:
         await msg_obj.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
@@ -122,6 +111,7 @@ def main_menu_kb():
         [
             [InlineKeyboardButton("👤 Account", callback_data="account")],
             [InlineKeyboardButton("📋 List Apps", callback_data="list_apps")],
+            [InlineKeyboardButton("➕ Create App", callback_data="create_root")],
             [InlineKeyboardButton("🚀 Deploy (Choose App)", callback_data="deploy_root")],
             [InlineKeyboardButton("🌐 Env Vars (Choose App)", callback_data="env_root")],
             [InlineKeyboardButton("🪵 Logs (Choose App)", callback_data="logs_root")],
@@ -164,15 +154,13 @@ async def cmd_login(client: Client, message: Message):
     if len(message.command) < 2:
         await safe_reply(message, "Usage: <b>/login &lt;RENDER_API_KEY&gt;</b>", parse_mode=ParseMode.HTML)
         return
-
     api_key = message.command[1].strip()
     api = RenderAPI(api_key)
     ok, data = api.test_key()
     if not ok:
-        reason = data.get("message") if isinstance(data, dict) else data
+        reason = data.get("body") if isinstance(data, dict) else data
         await safe_reply(message, f"❌ Invalid API key or API unreachable.\n{html.escape(str(reason))}", parse_mode=ParseMode.HTML)
         return
-
     state.setdefault("api_keys", {})[str(message.from_user.id)] = api_key
     save_state()
     await safe_reply(message, "✅ API key saved. Use the menu below.", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
@@ -198,9 +186,13 @@ async def on_cb(client: Client, callback: CallbackQuery):
             info_text = html.escape(str(info))[:2000]
             await safe_edit(callback.message, f"❌ Could not fetch account.\n{info_text}", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
             return
-        name = html.escape(str(info.get("name", info.get("email", "-"))))
-        email = html.escape(str(info.get("email", "-")))
-        acc_id = html.escape(str(info.get("id", "-")))
+        # info may be list or dict - Render returns user object possibly wrapped
+        user_obj = info
+        if isinstance(info, list) and len(info) > 0:
+            user_obj = info[0]
+        name = html.escape(str(user_obj.get("name", user_obj.get("email", "-")))) if isinstance(user_obj, dict) else html.escape(str(user_obj))
+        email = html.escape(str(user_obj.get("email", "-"))) if isinstance(user_obj, dict) else "-"
+        acc_id = html.escape(str(user_obj.get("id", "-"))) if isinstance(user_obj, dict) else "-"
         text = f"<b>Account</b>\nName: {name}\nEmail: {email}\nID: {acc_id}"
         await safe_edit(callback.message, text, reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
         return
@@ -214,17 +206,28 @@ async def on_cb(client: Client, callback: CallbackQuery):
         if not ok:
             await safe_edit(callback.message, f"❌ Failed to list services.\n{html.escape(str(svcs))}", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
             return
-        if not svcs:
+        items = svcs if isinstance(svcs, list) else svcs.get("services") if isinstance(svcs, dict) else svcs
+        if not items:
             await safe_edit(callback.message, "No services found.", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
             return
         rows = []
-        for s in svcs:
+        for s in items:
             service = s.get("service", s) if isinstance(s, dict) else s
             sid = service.get("id") or s.get("id")
             sname = html.escape(str(service.get("name") or s.get("name") or "unknown"))
-            rows.append([InlineKeyboardButton(f"📱 {sname}", callback_data=f"svc:{sid}")])
+            url_hint = RenderAPI.extract_service_url(service)
+            label = f"📱 {sname}"
+            if url_hint:
+                label += f" → {url_hint}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"svc:{sid}")])
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
         await safe_edit(callback.message, "📋 <b>Your Services</b>:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        return
+
+    # CREATE APP root
+    if data == "create_root":
+        pending_actions[str(callback.from_user.id)] = {"type": "create_app"}
+        await safe_edit(callback.message, "Send create payload as:\nname | https://github.com/USER/REPO | branch(optional)\nExample:\nmy-app | https://github.com/me/repo | main", reply_markup=None, parse_mode=ParseMode.HTML)
         return
 
     # ROOT ACTION INSTRUCT
@@ -248,7 +251,8 @@ async def on_cb(client: Client, callback: CallbackQuery):
         stype = html.escape(str(service.get("type", "-")))
         status = service.get("serviceDetails", {}).get("status") if service.get("serviceDetails") else service.get("status", "-")
         status = html.escape(str(status))
-        text = f"<b>{sname}</b>\nID: <code>{html.escape(sid)}</code>\nType: {stype}\nStatus: {status}"
+        url = RenderAPI.extract_service_url(service) or "(no public url)"
+        text = f"<b>{sname}</b>\nID: <code>{html.escape(sid)}</code>\nType: {stype}\nStatus: {status}\nURL: {html.escape(url)}"
         await safe_edit(callback.message, text, reply_markup=svc_menu_kb(sid), parse_mode=ParseMode.HTML)
         return
 
@@ -280,6 +284,7 @@ async def on_cb(client: Client, callback: CallbackQuery):
     # DELETE
     if data.startswith("svc_delete:"):
         sid = data.split(":", 1)[1]
+        # Confirm delete? quick deletion for now
         await safe_edit(callback.message, "⚠️ Deleting service...", reply_markup=None, parse_mode=ParseMode.HTML)
         ok, res = api.delete_service(sid)
         if ok:
@@ -298,6 +303,7 @@ async def on_cb(client: Client, callback: CallbackQuery):
             return
         text_out = ""
         if isinstance(logs, dict):
+            # expected keys: logs (list) or other
             if "logs" in logs and isinstance(logs["logs"], list):
                 lines = [str(r.get("message", "")) for r in logs["logs"]]
                 text_out = "\n".join(lines[-200:])
@@ -353,49 +359,73 @@ async def on_cb(client: Client, callback: CallbackQuery):
         await safe_edit(callback.message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    # ADD ENV -> set pending
+    # ADD ENV -> pending
     if data.startswith("env_add:"):
         sid = data.split(":", 1)[1]
         pending_actions[str(callback.from_user.id)] = {"type": "env_add", "service_id": sid}
         await safe_edit(callback.message, "Send env var(s) lines like:\nKEY=VALUE\nMULTI=lines\n\n(Will upsert)", reply_markup=None, parse_mode=ParseMode.HTML)
         return
 
-    # DELETE ENV -> set pending
+    # DELETE ENV -> pending
     if data.startswith("env_del:"):
         sid = data.split(":", 1)[1]
         pending_actions[str(callback.from_user.id)] = {"type": "env_del", "service_id": sid}
         await safe_edit(callback.message, "Send the ENV KEY (exact name) you want to delete:", reply_markup=None, parse_mode=ParseMode.HTML)
         return
 
-    # SET REPO -> set pending
+    # SET REPO -> pending
     if data.startswith("svc_repo_set:"):
         sid = data.split(":", 1)[1]
         pending_actions[str(callback.from_user.id)] = {"type": "set_repo", "service_id": sid}
         await safe_edit(callback.message, "Send repo & branch like:\nhttps://github.com/USER/REPO | main\n(Branch optional; default main)", reply_markup=None, parse_mode=ParseMode.HTML)
         return
 
-    # Unknown action fallback
+    # Unknown fallback
     await safe_edit(callback.message, "Unknown action. Use /menu.", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
 
-# ---------------- pending actions handler ----------------
+# ---------------- pending_text handler ----------------
 @app.on_message(filters.private & filters.text)
 async def handle_pending_text(client: Client, message: Message):
     key = str(message.from_user.id)
     if key not in pending_actions:
-        return  # nothing pending
-
+        return
     action = pending_actions.pop(key)
     save_state()
     typ = action.get("type")
     sid = action.get("service_id")
     api = api_for(message.from_user.id)
+    if typ == "create_app":
+        # parse "name | repo | branch"
+        parts = [p.strip() for p in message.text.strip().split("|")]
+        if len(parts) < 2:
+            await safe_reply(message, "Invalid format. Use: name | https://github.com/USER/REPO | branch(optional)", parse_mode=ParseMode.HTML)
+            return
+        name = parts[0]
+        repo = parts[1]
+        branch = parts[2] if len(parts) >= 3 else "main"
+        # Use user's API key
+        if not api:
+            await safe_reply(message, "Please /login first.", parse_mode=ParseMode.HTML)
+            return
+        await safe_reply(message, "🛠 Creating service...", parse_mode=ParseMode.HTML)
+        ok, res = api.create_service(name=name, repo=repo, branch=branch, service_type="web")
+        if ok:
+            svc = res if isinstance(res, dict) else {}
+            sid_new = svc.get("id") or svc.get("service", {}).get("id", "-")
+            url = RenderAPI.extract_service_url(svc.get("service", svc) if isinstance(svc, dict) else svc)
+            text = f"✅ Created service.\nID: <code>{html.escape(str(sid_new))}</code>"
+            if url:
+                text += f"\nURL: {html.escape(url)}"
+            await safe_reply(message, text, parse_mode=ParseMode.HTML)
+        else:
+            await safe_reply(message, f"❌ Create failed.\n{html.escape(str(res))}", parse_mode=ParseMode.HTML)
+        return
+
     if not api:
         await safe_reply(message, "Please /login first.", parse_mode=ParseMode.HTML)
         return
 
     text = message.text.strip()
-
-    # ENV ADD
     if typ == "env_add":
         kv = {}
         for line in text.splitlines():
@@ -415,7 +445,6 @@ async def handle_pending_text(client: Client, message: Message):
             await safe_reply(message, f"❌ Failed to upsert env vars.\n{html.escape(str(res))}", reply_markup=svc_menu_kb(sid), parse_mode=ParseMode.HTML)
         return
 
-    # ENV DELETE
     if typ == "env_del":
         key_name = text.strip()
         if not key_name:
@@ -428,7 +457,6 @@ async def handle_pending_text(client: Client, message: Message):
             await safe_reply(message, f"❌ Delete failed.\n{html.escape(str(res))}", reply_markup=svc_menu_kb(sid), parse_mode=ParseMode.HTML)
         return
 
-    # SET REPO
     if typ == "set_repo":
         if "|" in text:
             repo_raw, branch_raw = text.split("|", 1)
@@ -437,7 +465,7 @@ async def handle_pending_text(client: Client, message: Message):
         else:
             repo = text
             branch = "main"
-        ok, res = api.set_repo(sid, repo=repo, branch=branch)
+        ok, res = api.set_repo(sid, repo=repo, branch=branch) if hasattr(api, "set_repo") else (False, "set_repo not implemented in wrapper")
         if ok:
             state.setdefault("repos", {})[sid] = {"repo": repo, "branch": branch}
             save_state()
@@ -446,10 +474,9 @@ async def handle_pending_text(client: Client, message: Message):
             await safe_reply(message, f"❌ Failed to set repo.\n{html.escape(str(res))}", reply_markup=svc_menu_kb(sid), parse_mode=ParseMode.HTML)
         return
 
-    # fallback
     await safe_reply(message, "Action processed or invalid input.", parse_mode=ParseMode.HTML)
 
-# ---------------- utility commands ----------------
+# small helper
 @app.on_message(filters.command("whoami"))
 async def whoami(_, m: Message):
     api = api_for(m.from_user.id)
@@ -459,7 +486,7 @@ async def whoami(_, m: Message):
     ok, info = api.owner()
     await m.reply_text(f"Owner fetch ok={ok}\n{json.dumps(info, indent=2)[:3000]}")
 
-# ---------------- run ----------------
+# launch
 if __name__ == "__main__":
     print("🤖 Render Manager Bot starting...")
     app.run()
