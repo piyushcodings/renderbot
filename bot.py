@@ -9,6 +9,8 @@ from pyrogram.types import (
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
 DB_PATH = os.getenv("DB_PATH", "render_manager.db")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")  # optional (Fernet key)
 
@@ -189,7 +191,7 @@ def ensure_key(user_id: int) -> Optional[str]:
     return key
 
 # ---------- Bot ----------
-app = Client("render-manager-bot", api_id=1, api_hash="1", bot_token=BOT_TOKEN)  # api_id/hash not used for bots
+app = Client("render-manager-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)  # api_id/hash not used for bots
 
 WELCOME = (
 "Welcome to *Render Manager*.\n\n"
