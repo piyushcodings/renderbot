@@ -1,489 +1,582 @@
-# bot.py
-"""
-Render Manager Bot - full working version (~700 lines)
-Features:
-- /start, /login <API_KEY>
-- Inline menus: Account, List Apps, Create App, Repo Mappings
-- List Apps with safe limits
-- Service menu: Status, Logs (pagination), Restart, Deploy, Set Repo/Start, Env Vars
-- Create flow asks for service type, then collects details
-- OwnerId resolution
-- Safe HTML parsing with fallback
-- State persisted in state.json (api_keys, repos, pending flows)
-- Full private chat handling for /create, /setrepo, env vars
-"""
+import os, json, sqlite3, time, textwrap
+from typing import Dict, Any, Optional, List, Tuple
+import requests
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, Message, ForceReply
+)
 
-import os
-import json
-import logging
-from typing import Any, Dict, Optional
+# ---------- Config ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
+DB_PATH = os.getenv("DB_PATH", "render_manager.db")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")  # optional (Fernet key)
 
-import asyncio
-from pyrogram import Client, filters, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
-from pyrogram.enums import ParseMode
+# ---------- Optional encryption for API keys ----------
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    FERNET = Fernet(ENCRYPTION_KEY) if ENCRYPTION_KEY else None
+except Exception:
+    FERNET = None
 
-from render_api import RenderAPI, VALID_SERVICE_TYPES
+# ---------- DB ----------
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+  user_id INTEGER PRIMARY KEY,
+  api_key TEXT NOT NULL,
+  workspace_id TEXT DEFAULT NULL
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS states (
+  user_id INTEGER PRIMARY KEY,
+  action TEXT,
+  data TEXT
+)
+""")
+conn.commit()
 
-# ------------- config -------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH")
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-# ----------------------------------
+def enc(s: str) -> str:
+    if FERNET: return FERNET.encrypt(s.encode()).decode()
+    return s
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("render_bot")
+def dec(s: str) -> str:
+    if FERNET:
+        try: return FERNET.decrypt(s.encode()).decode()
+        except InvalidToken: return ""
+    return s
 
-if not BOT_TOKEN or not API_ID or not API_HASH:
-    logger.warning("BOT_TOKEN/API_ID/API_HASH are recommended to be set in environment.")
+def set_api_key(user_id: int, key: str):
+    e = enc(key)
+    cur.execute("INSERT INTO users(user_id, api_key) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET api_key=excluded.api_key", (user_id, e))
+    conn.commit()
 
-app = Client("render_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+def get_api_key(user_id: int) -> Optional[str]:
+    row = cur.execute("SELECT api_key FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return dec(row[0]) if row else None
 
-# ---------- state ----------
-if os.path.exists(STATE_FILE):
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state: Dict[str, Any] = json.load(f)
-    except Exception:
-        state = {"api_keys": {}, "repos": {}, "_pending": {}}
-else:
-    state = {"api_keys": {}, "repos": {}, "_pending": {}}
+def set_workspace(user_id: int, ws_id: Optional[str]):
+    cur.execute("UPDATE users SET workspace_id=? WHERE user_id=?", (ws_id, user_id))
+    conn.commit()
 
+def get_workspace(user_id: int) -> Optional[str]:
+    row = cur.execute("SELECT workspace_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return row[0] if row else None
 
-def save_state():
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        logger.exception("Failed to save state")
+def set_state(user_id: int, action: Optional[str], data: Dict[str, Any]):
+    cur.execute("INSERT INTO states(user_id, action, data) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET action=excluded.action, data=excluded.data",
+                (user_id, action, json.dumps(data)))
+    conn.commit()
 
+def get_state(user_id: int) -> Tuple[Optional[str], Dict[str, Any]]:
+    row = cur.execute("SELECT action, data FROM states WHERE user_id=?", (user_id,)).fetchone()
+    if not row: return None, {}
+    return row[0], (json.loads(row[1]) if row[1] else {})
 
-def set_user_key(user_id: int, key: str):
-    state.setdefault("api_keys", {})[str(user_id)] = key
-    save_state()
+def clear_state(user_id: int):
+    cur.execute("DELETE FROM states WHERE user_id=?", (user_id,))
+    conn.commit()
 
+# ---------- Render API helper ----------
+BASE = "https://api.render.com/v1"
 
-def get_user_key(user_id: int) -> Optional[str]:
-    return state.get("api_keys", {}).get(str(user_id))
+class Render:
+    def __init__(self, key: str):
+        self.h = {
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
-
-def set_repo_mapping(service_id: str, repo: str, branch: str = "main", start_command: Optional[str] = None):
-    state.setdefault("repos", {})[service_id] = {"repo": repo, "branch": branch, "startCommand": start_command}
-    save_state()
-
-
-def get_repo_mapping(service_id: str):
-    return state.get("repos", {}).get(service_id)
-
-
-def set_pending(user_id: int, entry: dict):
-    state.setdefault("_pending", {})[str(user_id)] = entry
-    save_state()
-
-
-def pop_pending(user_id: int) -> Optional[dict]:
-    return state.setdefault("_pending", {}).pop(str(user_id), None)
-
-
-# ---------- helpers ----------
-def html_escape(s: Optional[str]) -> str:
-    if s is None:
-        return ""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-async def safe_edit(msg_obj: Message, text: str, reply_markup=None, parse_mode=ParseMode.HTML):
-    try:
-        await msg_obj.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except errors.MessageNotModified:
-        return
-    except errors.RPCError as e:
-        es = str(e)
-        logger.debug("safe_edit RPCError: %s", es)
-        if "ENTITY_BOUNDS_INVALID" in es or "Invalid parse mode" in es or "entities" in es:
+    def _r(self, method: str, path: str, **kw):
+        url = f"{BASE}{path}"
+        r = requests.request(method, url, headers=self.h, timeout=30, **kw)
+        if r.status_code >= 400:
             try:
-                await msg_obj.reply_text(text, reply_markup=reply_markup)
+                j = r.json()
             except Exception:
-                logger.exception("Fallback reply_text in safe_edit failed")
-        else:
-            logger.exception("RPCError in safe_edit")
-    except Exception:
-        logger.exception("Unexpected error in safe_edit")
+                j = {"message": r.text}
+            raise RuntimeError(f"{r.status_code} {j}")
+        return r.json() if r.content else {}
 
+    # Identity & Workspaces
+    def me(self): return self._r("GET", "/users/me")
+    def workspaces(self): return self._r("GET", "/workspaces")
 
-async def safe_reply(msg_obj: Message, text: str, reply_markup=None, parse_mode=ParseMode.HTML):
-    try:
-        await msg_obj.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except errors.RPCError as e:
-        es = str(e)
-        logger.debug("safe_reply RPCError: %s", es)
-        if "ENTITY_BOUNDS_INVALID" in es or "Invalid parse mode" in es or "entities" in es:
-            try:
-                await msg_obj.reply_text(text, reply_markup=reply_markup)
-            except Exception:
-                logger.exception("Fallback plain reply_text failed")
-        else:
-            logger.exception("Unexpected RPCError in safe_reply")
-    except Exception:
-        logger.exception("Unexpected error in safe_reply")
+    # Services
+    def list_services(self, limit=20, cursor=None):
+        q = f"?limit={limit}" + (f"&cursor={cursor}" if cursor else "")
+        return self._r("GET", f"/services{q}")
 
+    def get_service(self, service_id: str):
+        return self._r("GET", f"/services/{service_id}")
 
-# ---------- keyboards ----------
+    def create_service(self, payload: Dict[str, Any]):
+        return self._r("POST", "/services", json=payload)
+
+    def delete_service(self, service_id: str):
+        return self._r("DELETE", f"/services/{service_id}")
+
+    # Actions
+    def trigger_deploy(self, service_id: str):
+        return self._r("POST", f"/services/{service_id}/deploys")
+
+    def restart(self, service_id: str):
+        return self._r("POST", f"/services/{service_id}/restart")
+
+    def suspend(self, service_id: str):
+        return self._r("POST", f"/services/{service_id}/suspend")
+
+    def resume(self, service_id: str):
+        return self._r("POST", f"/services/{service_id}/resume")
+
+    # Env vars
+    def list_env_vars(self, service_id: str):
+        return self._r("GET", f"/services/{service_id}/env-vars")
+
+    def put_env_vars(self, service_id: str, envs: List[Dict[str, str]]):
+        # replaces or inserts keys passed
+        return self._r("PUT", f"/services/{service_id}/env-vars", json=envs)
+
+    # Logs
+    def recent_logs(self, service_id: str, limit=100):
+        return self._r("GET", f"/logs?serviceId={service_id}&limit={limit}")
+
+# ---------- UI helpers ----------
 def main_menu():
-    kb = [
-        [InlineKeyboardButton("👤 Account", callback_data="account")],
-        [InlineKeyboardButton("📋 List Apps", callback_data="list_apps")],
-        [InlineKeyboardButton("➕ Create App", callback_data="create_root")],
-        [InlineKeyboardButton("🗂 Repo Mappings", callback_data="repo_mappings")],
-    ]
-    return InlineKeyboardMarkup(kb)
-
-
-def service_menu(sid: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 Status", callback_data=f"svc_status:{sid}")],
-        [InlineKeyboardButton("🪵 Logs", callback_data=f"svc_logs:{sid}:1"),
-         InlineKeyboardButton("🔄 Restart", callback_data=f"svc_restart:{sid}")],
-        [InlineKeyboardButton("🔗 Set Repo/Start", callback_data=f"svc_repo_set:{sid}"),
-         InlineKeyboardButton("🚀 Deploy", callback_data=f"svc_deploy:{sid}")],
-        [InlineKeyboardButton("🌐 Env Vars", callback_data=f"svc_env:{sid}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="list_apps")],
+        [InlineKeyboardButton("👤 Account", callback_data="acct"),
+         InlineKeyboardButton("🧰 Workspaces", callback_data="workspaces")],
+        [InlineKeyboardButton("📋 List Services", callback_data="svc:list"),
+         InlineKeyboardButton("🚀 Deploy from Git", callback_data="create")],
     ])
 
-
-def logs_nav(sid: str, page: int):
-    kb = [
-        [InlineKeyboardButton("◀️ Prev", callback_data=f"svc_logs:{sid}:{max(1, page-1)}"),
-         InlineKeyboardButton("▶️ Next", callback_data=f"svc_logs:{sid}:{page+1}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data=f"svc:{sid}")]
+def service_actions(svc: Dict[str, Any]):
+    sid = svc["id"]
+    rows = [
+        [InlineKeyboardButton("🔁 Trigger Deploy", callback_data=f"svc:deploy:{sid}"),
+         InlineKeyboardButton("♻️ Restart", callback_data=f"svc:restart:{sid}")],
+        [InlineKeyboardButton("⏸ Suspend", callback_data=f"svc:suspend:{sid}"),
+         InlineKeyboardButton("▶️ Resume", callback_data=f"svc:resume:{sid}")],
+        [InlineKeyboardButton("🧪 Logs", callback_data=f"svc:logs:{sid}"),
+         InlineKeyboardButton("🌐 Env Vars", callback_data=f"svc:env:{sid}")],
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"svc:delete:{sid}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="svc:list")]
     ]
-    return InlineKeyboardMarkup(kb)
-
-
-def service_type_kb():
-    rows = []
-    label_map = {
-        "Web Service": "web_service",
-        "Static Site": "static_site",
-        "Private Service": "private_service",
-        "Background Worker": "background_worker",
-        "Cron Job": "cron_job",
-        "Workflow": "workflow"
-    }
-    for label, stype in label_map.items():
-        rows.append([InlineKeyboardButton(label, callback_data=f"create_type:{stype}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
     return InlineKeyboardMarkup(rows)
 
+def type_picker():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Web", callback_data="new:type:web_service"),
+         InlineKeyboardButton("🛡 Private", callback_data="new:type:private_service")],
+        [InlineKeyboardButton("⚙️ Worker", callback_data="new:type:background_worker"),
+         InlineKeyboardButton("⏰ Cron", callback_data="new:type:cron_job")],
+        [InlineKeyboardButton("📄 Static Site", callback_data="new:type:static_site")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="cancel")]
+    ])
 
-# ---------- commands ----------
+def workspace_kb(workspaces: List[Dict[str, Any]], back_to: str):
+    rows = []
+    for w in workspaces:
+        rows.append([InlineKeyboardButton(f"{w.get('name')} ({w.get('id')})", callback_data=f"ws:set:{w['id']}|{back_to}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=back_to)])
+    return InlineKeyboardMarkup(rows)
+
+def ensure_key(user_id: int) -> Optional[str]:
+    key = get_api_key(user_id)
+    return key
+
+# ---------- Bot ----------
+app = Client("render-manager-bot", api_id=1, api_hash="1", bot_token=BOT_TOKEN)  # api_id/hash not used for bots
+
+WELCOME = (
+"Welcome to *Render Manager*.\n\n"
+"• First, save your Render API key:\n"
+"`/login <RENDER_API_KEY>`\n\n"
+"Your key is stored per-user in a local DB (optionally Fernet-encrypted)."
+)
+
 @app.on_message(filters.command("start"))
-async def cmd_start(_, message: Message):
-    text = ("<b>Render Manager Bot</b>\n\n"
-            "Commands:\n"
-            "/login <RENDER_API_KEY> — save your Render API key (private)\n"
-            "/create <NAME> | <GIT_REPO> | <branch optional> | <startCommand optional>\n\n"
-            "Use the inline menu below.")
-    await safe_reply(message, text, reply_markup=main_menu())
+async def start(_, m: Message):
+    await m.reply_text(WELCOME, reply_markup=main_menu(), parse_mode=enums.ParseMode.MARKDOWN)
 
-
-@app.on_message(filters.command("login"))
-async def cmd_login(_, message: Message):
-    if len(message.command) < 2:
-        await safe_reply(message, "Usage: /login <RENDER_API_KEY>")
+@app.on_message(filters.command("login") & filters.private)
+async def login_cmd(_, m: Message):
+    parts = m.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        await m.reply_text("Send: `/login <RENDER_API_KEY>`", parse_mode=enums.ParseMode.MARKDOWN)
         return
-    api_key = message.command[1].strip()
-    api = RenderAPI(api_key)
-    ok, data = await api.owners()
-    if not ok:
-        await safe_reply(message, f"❌ Invalid key or API unreachable.\n{data}")
-        return
-    set_user_key(message.from_user.id, api_key)
-    await safe_reply(message, "✅ API key saved. Use the menu below.", reply_markup=main_menu())
+    key = parts[1].strip()
+    set_api_key(m.from_user.id, key)
+    await m.reply_text("✅ API key saved.\nTap *Account* to verify.", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=main_menu())
 
-
-@app.on_message(filters.command("whoami"))
-async def cmd_whoami(_, message: Message):
-    key = get_user_key(message.from_user.id)
-    if not key:
-        await safe_reply(message, "Not logged in. Use /login <RENDER_API_KEY>")
-        return
-    api = RenderAPI(key)
-    ok, owners = await api.owners()
-    if not ok:
-        await safe_reply(message, f"❌ Failed to fetch owners.\n{owners}")
-        return
-    lines = []
-    if isinstance(owners, list):
-        for item in owners:
-            owner = item.get("owner") if isinstance(item, dict) else None
-            if owner:
-                lines.append(f"{owner.get('type')} • {owner.get('name')} • {owner.get('id')}")
-    else:
-        lines.append(str(owners))
-    await safe_reply(message, "<b>Owners / Workspaces</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-# ---------- callbacks ----------
+# ---------- Callbacks ----------
 @app.on_callback_query()
-async def on_cb(client: Client, callback: CallbackQuery):
-    data = callback.data or ""
-    uid = callback.from_user.id
-    api_key = get_user_key(uid)
-    api = RenderAPI(api_key) if api_key else None
-
-    # ACCOUNT
-    if data == "account":
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        ok, owners = await api.owners()
-        if not ok:
-            await safe_edit(callback.message, f"❌ Could not fetch owners.\n{owners}", reply_markup=main_menu())
-            return
-        out = []
-        if isinstance(owners, list):
-            for item in owners:
-                owner = item.get("owner")
-                out.append(f"<b>{html_escape(owner.get('name'))}</b>\nType: {html_escape(owner.get('type'))}\nID: <code>{html_escape(owner.get('id'))}</code>")
-        else:
-            out.append(html_escape(str(owners)))
-        await safe_edit(callback.message, "👤 Account / Owners:\n\n" + "\n\n".join(out), reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+async def on_cb(_, cq: CallbackQuery):
+    uid = cq.from_user.id
+    key = ensure_key(uid)
+    if not key:
+        await cq.message.edit_text("❗️No API key yet.\nSend: `/login <RENDER_API_KEY>`", parse_mode=enums.ParseMode.MARKDOWN)
+        await cq.answer()
         return
+    api = Render(key)
 
-    # LIST APPS
-    if data == "list_apps":
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        ok, svcs = await api.list_services(limit=50)
-        if not ok:
-            await safe_edit(callback.message, f"❌ Failed to list services.\n{svcs}", reply_markup=main_menu())
-            return
-        items = svcs if isinstance(svcs, list) else (svcs.get("services") if isinstance(svcs, dict) else [])
-        if not items:
-            await safe_edit(callback.message, "No services found.", reply_markup=main_menu())
-            return
-        rows = []
-        for s in items:
-            svc = s.get("service") if isinstance(s, dict) and "service" in s else s
-            sid = svc.get("id") if isinstance(svc, dict) else s.get("id")
-            name = svc.get("name") if isinstance(svc, dict) else str(s)
-            url = svc.get("defaultDomain") or (svc.get("serviceDetails") or {}).get("defaultDomain") or ""
-            label = f"📱 {name}" + (f" → {url}" if url else "")
-            rows.append([InlineKeyboardButton(label, callback_data=f"svc:{sid}")])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
-        await safe_edit(callback.message, "📋 <b>Your Services</b>:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
-        return
+    data = cq.data
 
-    # CREATE ROOT
-    if data == "create_root":
-        await safe_edit(callback.message, "Select a service type to create:", reply_markup=service_type_kb())
-        return
-
-    # SERVICE TYPE selected
-    if data.startswith("create_type:"):
-        stype = data.split(":", 1)[1]
-        if stype not in VALID_SERVICE_TYPES:
-            await safe_edit(callback.message, "Invalid service type selected.", reply_markup=main_menu())
-            return
-        set_pending(uid, {"type": "create", "service_type": stype})
-        await safe_edit(callback.message,
-                        f"Selected <b>{html_escape(stype)}</b>.\nSend create details in private chat using:\n"
-                        "`/create <NAME> | <GIT_REPO optional> | <branch optional> | <startCommand optional>`",
-                        reply_markup=main_menu(), parse_mode=ParseMode.HTML)
-        return
-
-    # REPO MAPPINGS
-    if data == "repo_mappings":
-        rows = []
-        for sid, info in state.get("repos", {}).items():
-            rows.append([InlineKeyboardButton(f"{sid} • {info.get('repo')}@{info.get('branch')}", callback_data=f"repo_info:{sid}")])
-        if not rows:
-            await safe_edit(callback.message, "No repo mappings stored.", reply_markup=main_menu())
-        else:
-            rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
-            await safe_edit(callback.message, "<b>Repo mappings</b>:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
-        return
-
-    if data.startswith("repo_info:"):
-        sid = data.split(":", 1)[1]
-        mp = get_repo_mapping(sid)
-        if not mp:
-            await safe_edit(callback.message, "No mapping found.", reply_markup=main_menu())
-            return
-        txt = f"<b>Service {sid}</b>\nRepo: <code>{html_escape(mp.get('repo'))}</code>\nBranch: <code>{html_escape(mp.get('branch'))}</code>\nStart: <code>{html_escape(mp.get('startCommand'))}</code>"
-        await safe_edit(callback.message, txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="repo_mappings")]]), parse_mode=ParseMode.HTML)
-        return
-
-    # SERVICE entry
-    if data.startswith("svc:"):
-        sid = data.split(":", 1)[1]
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        ok, svc = await api.get_service(sid)
-        if not ok:
-            await safe_edit(callback.message, f"❌ Could not fetch service:\n{svc}", reply_markup=main_menu())
-            return
-        service = svc.get("service") if isinstance(svc, dict) and "service" in svc else svc
-        name = service.get("name") if isinstance(service, dict) else str(service)
-        txt = f"<b>Service:</b> {html_escape(name)}\nID: <code>{html_escape(sid)}</code>"
-        await safe_edit(callback.message, txt, reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
-        return
-
-    # SERVICE STATUS
-    if data.startswith("svc_status:"):
-        sid = data.split(":", 1)[1]
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        ok, status = await api.get_status(sid)
-        if not ok:
-            await safe_edit(callback.message, f"❌ Could not get status:\n{status}", reply_markup=service_menu(sid))
-            return
-        txt = f"<b>Status for {sid}</b>\n" + json.dumps(status, indent=2)
-        await safe_edit(callback.message, txt, reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
-        return
-
-    # SERVICE LOGS
-    if data.startswith("svc_logs:"):
+    # Main items
+    if data == "acct":
         try:
-            _, sid, page = data.split(":")
-            page = int(page)
-        except:
-            page = 1
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            me = api.me()
+            ws = get_workspace(uid)
+            txt = textwrap.dedent(f"""
+            *Account*
+            • Name: `{me.get('name')}`
+            • Email: `{me.get('email')}`
+            • ID: `{me.get('id')}`
+            • Selected Workspace (ownerId for new services): `{ws or 'not set'}`
+            """).strip()
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧰 Choose Workspace", callback_data="workspaces")],
+                [InlineKeyboardButton("⬅️ Menu", callback_data="menu")]
+            ])
+            await cq.message.edit_text(txt, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception as e:
+            await cq.message.edit_text(f"⚠️ {e}", reply_markup=main_menu())
+        await cq.answer(); return
+
+    if data == "workspaces":
+        try:
+            w = api.workspaces()
+            await cq.message.edit_text("*Pick a workspace (ownerId)*", parse_mode=enums.ParseMode.MARKDOWN,
+                                       reply_markup=workspace_kb(w, "menu"))
+        except Exception as e:
+            await cq.message.edit_text(f"⚠️ {e}", reply_markup=main_menu())
+        await cq.answer(); return
+
+    if data == "menu":
+        await cq.message.edit_text("Main menu:", reply_markup=main_menu()); await cq.answer(); return
+
+    # Workspace set
+    if data.startswith("ws:set:"):
+        _, _, rest = data.partition("ws:set:")
+        ws_id, back_to = rest.split("|", 1)
+        set_workspace(uid, ws_id)
+        await cq.message.edit_text(f"✅ Workspace set to `{ws_id}`.", parse_mode=enums.ParseMode.MARKDOWN,
+                                   reply_markup=main_menu() if back_to=="menu" else type_picker())
+        await cq.answer(); return
+
+    # List services
+    if data == "svc:list":
+        try:
+            lst = api.list_services(limit=50)
+            rows = []
+            for s in lst.get("items", lst if isinstance(lst, list) else []):
+                label = f"{s.get('name')} · {s.get('type')} · {s.get('region','')}"
+                rows.append([InlineKeyboardButton(label, callback_data=f"svc:open:{s['id']}")])
+            rows.append([InlineKeyboardButton("⬅️ Menu", callback_data="menu")])
+            await cq.message.edit_text("*Your services:*", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+        except Exception as e:
+            await cq.message.edit_text(f"⚠️ {e}", reply_markup=main_menu())
+        await cq.answer(); return
+
+    # Open a service
+    if data.startswith("svc:open:"):
+        sid = data.split(":")[2]
+        try:
+            s = api.get_service(sid)
+            txt = textwrap.dedent(f"""
+            *{s.get('name')}*
+            • id: `{s.get('id')}`
+            • type: `{s.get('type')}`
+            • region: `{s.get('region')}`
+            • repo/branch: `{s.get('repo')}` @ `{s.get('branch')}`
+            • plan: `{s.get('plan')}`
+            • autoDeploy: `{s.get('autoDeploy')}`
+            • url: {s.get('url','—')}
+            """).strip()
+            await cq.message.edit_text(txt, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=service_actions(s))
+        except Exception as e:
+            await cq.message.edit_text(f"⚠️ {e}", reply_markup=main_menu())
+        await cq.answer(); return
+
+    # Service actions
+    if data.startswith("svc:deploy:"):
+        sid = data.split(":")[2]
+        try:
+            api.trigger_deploy(sid)
+            await cq.answer("Deploy triggered ✅", show_alert=False)
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("svc:restart:"):
+        sid = data.split(":")[2]
+        try:
+            api.restart(sid)
+            await cq.answer("Restart requested ♻️", show_alert=False)
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("svc:suspend:"):
+        sid = data.split(":")[2]
+        try:
+            api.suspend(sid)
+            await cq.answer("Service suspended ⏸", show_alert=False)
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("svc:resume:"):
+        sid = data.split(":")[2]
+        try:
+            api.resume(sid)
+            await cq.answer("Service resumed ▶️", show_alert=False)
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("svc:logs:"):
+        sid = data.split(":")[2]
+        try:
+            logs = api.recent_logs(sid, limit=200)
+            lines = [l.get("message","") for l in logs] if isinstance(logs, list) else []
+            chunk = "\n".join(lines[-50:]) or "No recent logs."
+            await cq.message.edit_text(f"```\n{chunk[-3500:]}\n```", parse_mode=enums.ParseMode.MARKDOWN,
+                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Service", callback_data=f"svc:open:{sid}")]]))
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("svc:env:"):
+        sid = data.split(":")[2]
+        try:
+            envs = api.list_env_vars(sid)
+            preview = "\n".join([f"{i['key']}={i.get('value','<secret>')}" for i in envs][:15])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Upsert (send K=V lines)", callback_data=f"env:put:{sid}")],
+                [InlineKeyboardButton("⬅️ Service", callback_data=f"svc:open:{sid}")]
+            ])
+            await cq.message.edit_text(f"*Env Vars (first 15):*\n```\n{preview}\n```", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    if data.startswith("env:put:"):
+        sid = data.split(":")[2]
+        set_state(uid, "env-put", {"sid": sid})
+        await cq.message.reply_text("Send env lines like:\n```\nKEY1=value1\nKEY2=value2\n```", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+        await cq.answer(); return
+
+    if data.startswith("svc:delete:"):
+        sid = data.split(":")[2]
+        set_state(uid, "confirm-delete", {"sid": sid})
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❗️Confirm Delete", callback_data=f"svc:confirmdelete:{sid}")],
+                                   [InlineKeyboardButton("Cancel", callback_data=f"svc:open:{sid}")]])
+        await cq.message.edit_text("Are you sure?", reply_markup=kb)
+        await cq.answer(); return
+
+    if data.startswith("svc:confirmdelete:"):
+        sid = data.split(":")[2]
+        try:
+            api.delete_service(sid)
+            await cq.message.edit_text("🗑 Deleted.", reply_markup=main_menu())
+            await cq.answer("Deleted")
+        except Exception as e:
+            await cq.answer(str(e), show_alert=True)
+        return
+
+    # Create service flow
+    if data == "create":
+        await cq.message.edit_text("*Choose service type*:", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=type_picker())
+        await cq.answer(); return
+
+    if data.startswith("new:type:"):
+        svc_type = data.split(":")[2]
+        payload = {"type": svc_type}
+        ws = get_workspace(uid)
+        if not ws:
+            # force workspace choose, then return to create flow
+            w = api.workspaces()
+            await cq.message.edit_text("*Pick a workspace first (ownerId)*", parse_mode=enums.ParseMode.MARKDOWN,
+                                       reply_markup=workspace_kb(w, "create"))
+            await cq.answer(); return
+        payload["ownerId"] = ws
+        set_state(uid, "new-name", payload)
+        await cq.message.reply_text("Enter *service name*:", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+        await cq.answer(); return
+
+    if data == "cancel":
+        clear_state(uid)
+        await cq.message.edit_text("Cancelled.", reply_markup=main_menu())
+        await cq.answer(); return
+
+# ---------- Text replies used in multi-step flows ----------
+@app.on_message(filters.private & ~filters.command(["start","login"]))
+async def on_text(_, m: Message):
+    uid = m.from_user.id
+    key = get_api_key(uid)
+    if not key:
+        return
+    api = Render(key)
+    action, data = get_state(uid)
+
+    if action == "env-put":
+        sid = data["sid"]
+        # parse KEY=VAL per line
+        upserts = []
+        for line in (m.text or "").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                upserts.append({"key": k.strip(), "value": v.strip()})
+        try:
+            if upserts:
+                api.put_env_vars(sid, upserts)
+                await m.reply_text(f"✅ Upserted {len(upserts)} vars.")
+            else:
+                await m.reply_text("No KEY=VALUE pairs found.")
+        except Exception as e:
+            await m.reply_text(f"⚠️ {e}")
+        clear_state(uid)
+        return
+
+    if action == "new-name":
+        data["name"] = m.text.strip()
+        # Git details
+        set_state(uid, "new-repo", data)
+        await m.reply_text("Send *Git repo URL* (e.g. `https://github.com/owner/repo`):", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+        return
+
+    if action == "new-repo":
+        data["repo"] = m.text.strip()
+        set_state(uid, "new-branch", data)
+        await m.reply_text("Branch name (e.g. `main`):", parse_mode=enums.ParseMode.MARKDOWN, reply_markup=ForceReply(selective=True))
+        return
+
+    if action == "new-branch":
+        data["branch"] = m.text.strip()
+
+        # Type-specific prompts
+        t = data["type"]
+        if t == "static_site":
+            set_state(uid, "new-static-build", data)
+            await m.reply_text("Build command (e.g. `npm ci && npm run build`):", reply_markup=ForceReply(selective=True))
             return
-        ok, logs = await api.get_logs(sid, page=page)
-        if not ok:
-            await safe_edit(callback.message, f"❌ Could not get logs:\n{logs}", reply_markup=service_menu(sid))
+        else:
+            # choose runtime env OR docker command
+            set_state(uid, "new-runtime", data)
+            await m.reply_text("Runtime env (one of `docker`, `node`, `python`, `go`, etc.). Send exactly one word:", reply_markup=ForceReply(selective=True))
             return
-        log_text = "\n".join(logs[:100]) if isinstance(logs, list) else str(logs)
-        await safe_edit(callback.message, f"<b>Logs page {page}</b>:\n<pre>{html_escape(log_text)}</pre>", reply_markup=logs_nav(sid, page), parse_mode=ParseMode.HTML)
+
+    if action == "new-static-build":
+        data["buildCommand"] = m.text.strip()
+        set_state(uid, "new-publish", data)
+        await m.reply_text("Publish path (folder to serve, e.g. `build` or `dist`):", reply_markup=ForceReply(selective=True))
         return
 
-    # SERVICE RESTART
-    if data.startswith("svc_restart:"):
-        sid = data.split(":", 1)[1]
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        ok, res = await api.restart_service(sid)
-        msg = "✅ Restarted successfully." if ok else f"❌ Failed: {res}"
-        await safe_edit(callback.message, msg, reply_markup=service_menu(sid))
+    if action == "new-publish":
+        data["publishPath"] = m.text.strip()
+        # plan/region/autodeploy
+        set_state(uid, "new-plan", data)
+        await m.reply_text("Plan (e.g. `starter`). If unsure, send `starter`:", reply_markup=ForceReply(selective=True))
         return
 
-    # SERVICE DEPLOY
-    if data.startswith("svc_deploy:"):
-        sid = data.split(":", 1)[1]
-        if not api:
-            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
-            return
-        repo = get_repo_mapping(sid)
-        if not repo:
-            await safe_edit(callback.message, "No repo mapping found. Set it first.", reply_markup=service_menu(sid))
-            return
-        ok, res = await api.deploy_service(sid, repo.get("repo"), repo.get("branch"), repo.get("startCommand"))
-        msg = "✅ Deployed successfully." if ok else f"❌ Deploy failed: {res}"
-        await safe_edit(callback.message, msg, reply_markup=service_menu(sid))
+    if action == "new-runtime":
+        env = m.text.strip()
+        data["env"] = env
+        if env == "docker":
+            set_state(uid, "new-docker-cmd", data)
+            await m.reply_text("Docker command (entrypoint). If not needed, send `-`:", reply_markup=ForceReply(selective=True))
+        else:
+            set_state(uid, "new-build", data)
+            await m.reply_text("Build command (send `-` if none):", reply_markup=ForceReply(selective=True))
         return
 
-    # SERVICE SET REPO
-    if data.startswith("svc_repo_set:"):
-        sid = data.split(":", 1)[1]
-        set_pending(uid, {"type": "set_repo", "service_id": sid})
-        await safe_edit(callback.message, f"Send repo info in private chat using:\n"
-                                          "`/setrepo <GIT_REPO> | <branch optional> | <startCommand optional>`",
-                        reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+    if action == "new-docker-cmd":
+        v = m.text.strip()
+        if v != "-": data["dockerCommand"] = v
+        set_state(uid, "new-plan", data)
+        await m.reply_text("Plan (e.g. `starter`). If unsure, send `starter`:", reply_markup=ForceReply(selective=True))
         return
 
-    # SERVICE ENV
-    if data.startswith("svc_env:"):
-        sid = data.split(":", 1)[1]
-        set_pending(uid, {"type": "env", "service_id": sid})
-        await safe_edit(callback.message, f"Send env vars in private chat using:\n"
-                                          "`/env <KEY1>=<VAL1> | <KEY2>=<VAL2> ...`",
-                        reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+    if action == "new-build":
+        v = m.text.strip()
+        if v != "-": data["buildCommand"] = v
+        set_state(uid, "new-start", data)
+        await m.reply_text("Start command (send `-` to skip):", reply_markup=ForceReply(selective=True))
         return
 
-
-# ---------- PRIVATE MESSAGE HANDLERS ----------
-@app.on_message(filters.private & filters.command("create"))
-async def pm_create(_, message: Message):
-    pending = pop_pending(message.from_user.id)
-    api_key = get_user_key(message.from_user.id)
-    if not api_key:
-        await safe_reply(message, "Please /login first.")
+    if action == "new-start":
+        v = m.text.strip()
+        if v != "-": data["startCommand"] = v
+        set_state(uid, "new-plan", data)
+        await m.reply_text("Plan (e.g. `starter`). If unsure, send `starter`:", reply_markup=ForceReply(selective=True))
         return
-    if not pending or pending.get("type") != "create":
-        await safe_reply(message, "Start creation from inline menu /start → Create App.")
+
+    if action == "new-plan":
+        data["plan"] = m.text.strip()
+        set_state(uid, "new-region", data)
+        await m.reply_text("Region (e.g. `oregon`, `frankfurt`, `singapore`):", reply_markup=ForceReply(selective=True))
         return
-    api = RenderAPI(api_key)
-    try:
-        parts = message.text.split(" ", 1)[1].split("|")
-        name = parts[0].strip()
-        repo = parts[1].strip() if len(parts) > 1 else None
-        branch = parts[2].strip() if len(parts) > 2 else "main"
-        startCommand = parts[3].strip() if len(parts) > 3 else None
-    except:
-        await safe_reply(message, "Invalid format. Use:\n`/create <NAME> | <GIT_REPO optional> | <branch optional> | <startCommand optional>`", parse_mode=ParseMode.HTML)
+
+    if action == "new-region":
+        data["region"] = m.text.strip()
+        # Optional rootDir & autoDeploy
+        set_state(uid, "new-rootdir", data)
+        await m.reply_text("Root directory within repo (send `-` if none):", reply_markup=ForceReply(selective=True))
         return
-    ok, svc = await api.create_service(pending["service_type"], name, repo, branch, startCommand)
-    if ok:
-        sid = svc.get("id") if isinstance(svc, dict) else str(svc)
-        await safe_reply(message, f"✅ Created service <b>{html_escape(name)}</b> with ID <code>{sid}</code>", parse_mode=ParseMode.HTML)
-    else:
-        await safe_reply(message, f"❌ Failed to create: {svc}")
 
-
-@app.on_message(filters.private & filters.command("setrepo"))
-async def pm_setrepo(_, message: Message):
-    pending = pop_pending(message.from_user.id)
-    if not pending or pending.get("type") != "set_repo":
-        await safe_reply(message, "Start from inline menu → Set Repo/Start")
+    if action == "new-rootdir":
+        v = m.text.strip()
+        if v != "-": data["rootDir"] = v
+        set_state(uid, "new-autodeploy", data)
+        await m.reply_text("Auto-deploy on push? Send `yes` or `no`:", reply_markup=ForceReply(selective=True))
         return
-    sid = pending["service_id"]
-    try:
-        parts = message.text.split(" ", 1)[1].split("|")
-        repo = parts[0].strip()
-        branch = parts[1].strip() if len(parts) > 1 else "main"
-        startCommand = parts[2].strip() if len(parts) > 2 else None
-        set_repo_mapping(sid, repo, branch, startCommand)
-        await safe_reply(message, f"✅ Repo mapping saved for {sid}.")
-    except:
-        await safe_reply(message, "Invalid format. Use:\n`/setrepo <GIT_REPO> | <branch optional> | <startCommand optional>`", parse_mode=ParseMode.HTML)
 
+    if action == "new-autodeploy":
+        data["autoDeploy"] = (m.text.strip().lower().startswith("y"))
+        # Build final payload per type
+        payload = {
+            "type": data["type"],
+            "name": data["name"],
+            "ownerId": get_workspace(uid),
+            "repo": data["repo"],
+            "branch": data["branch"],
+            "autoDeploy": data.get("autoDeploy", True),
+            "plan": data["plan"],
+            "region": data["region"]
+        }
+        if "rootDir" in data: payload["rootDir"] = data["rootDir"]
 
-@app.on_message(filters.private & filters.command("env"))
-async def pm_env(_, message: Message):
-    pending = pop_pending(message.from_user.id)
-    if not pending or pending.get("type") != "env":
-        await safe_reply(message, "Start from inline menu → Env Vars")
+        if data["type"] == "static_site":
+            payload.update({
+                "buildCommand": data.get("buildCommand"),
+                "publishPath": data.get("publishPath")
+            })
+        else:
+            payload["env"] = data.get("env", "node")
+            if payload["env"] == "docker":
+                if data.get("dockerCommand"): payload["dockerCommand"] = data["dockerCommand"]
+            else:
+                if data.get("buildCommand"): payload["buildCommand"] = data["buildCommand"]
+                if data.get("startCommand"): payload["startCommand"] = data["startCommand"]
+
+        try:
+            created = Render(get_api_key(uid)).create_service(payload)
+            clear_state(uid)
+            msg = textwrap.dedent(f"""
+            ✅ *Created* `{created.get('name')}`
+            • id: `{created.get('id')}`
+            • type: `{created.get('type')}`
+            • region: `{created.get('region')}`
+            • repo @ branch: `{created.get('repo')}` @ `{created.get('branch')}`
+            """).strip()
+            await m.reply_text(msg, parse_mode=enums.ParseMode.MARKDOWN,
+                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Trigger First Deploy", callback_data=f"svc:deploy:{created['id']}")],
+                                                                  [InlineKeyboardButton("⬅️ Menu", callback_data="menu")]]))
+        except Exception as e:
+            await m.reply_text(f"⚠️ Create failed: {e}")
         return
-    sid = pending["service_id"]
-    api_key = get_user_key(message.from_user.id)
-    if not api_key:
-        await safe_reply(message, "Please /login first.")
-        return
-    api = RenderAPI(api_key)
-    try:
-        parts = message.text.split(" ", 1)[1].split("|")
-        env_vars = {}
-        for p in parts:
-            if "=" in p:
-                k, v = p.strip().split("=", 1)
-                env_vars[k.strip()] = v.strip()
-        ok, res = await api.set_env(sid, env_vars)
-        msg = "✅ Env vars set." if ok else f"❌ Failed: {res}"
-        await safe_reply(message, msg)
-    except:
-        await safe_reply(message, "Invalid format. Use:\n`/env <KEY1>=<VAL1> | <KEY2>=<VAL2>`", parse_mode=ParseMode.HTML)
-
-
-# ---------- START ----------
-if __name__ == "__main__":
-    logger.info("Starting Render Manager Bot...")
-    app.run()
+app.run()
