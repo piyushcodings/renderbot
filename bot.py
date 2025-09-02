@@ -1,18 +1,18 @@
 # bot.py
 """
-Render Manager Bot - main bot file.
-
+Render Manager Bot - full working version (~700 lines)
 Features:
-- /start, /login <RENDER_API_KEY>
-- Inline menu: Account, List Apps, Create App (choose service type via inline keyboard)
-- List Apps with safe limit (<=100)
-- Per-service menu: Status, Logs (pagination), Restart, Deploy, Set Repo/Start, Env Vars
-- Create flow asks for service type (inline) then collects details in chat
-- OwnerId resolution using GET /owners (prefers team)
-- Safe parse mode handling and fallbacks for Telegram entity errors
-- State persisted in state.json (api keys, repo mappings, pending flows)
-- Uses render_api.RenderAPI for calls
+- /start, /login <API_KEY>
+- Inline menus: Account, List Apps, Create App, Repo Mappings
+- List Apps with safe limits
+- Service menu: Status, Logs (pagination), Restart, Deploy, Set Repo/Start, Env Vars
+- Create flow asks for service type, then collects details
+- OwnerId resolution
+- Safe HTML parsing with fallback
+- State persisted in state.json (api_keys, repos, pending flows)
+- Full private chat handling for /create, /setrepo, env vars
 """
+
 import os
 import json
 import logging
@@ -224,6 +224,7 @@ async def cmd_whoami(_, message: Message):
         lines.append(str(owners))
     await safe_reply(message, "<b>Owners / Workspaces</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
+
 # ---------- callbacks ----------
 @app.on_callback_query()
 async def on_cb(client: Client, callback: CallbackQuery):
@@ -232,28 +233,257 @@ async def on_cb(client: Client, callback: CallbackQuery):
     api_key = get_user_key(uid)
     api = RenderAPI(api_key) if api_key else None
 
-    # ACCOUNT, LIST APPS, CREATE, REPO MAPPINGS, SERVICE MENUS handled here...
-    # (All flows from your original bot.py included here exactly, fully)
-    # Logs pagination, restart, deploy, set repo/start, env vars, add/delete env
-    # Fallbacks and safe handling included exactly as in your code.
+    # ACCOUNT
+    if data == "account":
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, owners = await api.owners()
+        if not ok:
+            await safe_edit(callback.message, f"❌ Could not fetch owners.\n{owners}", reply_markup=main_menu())
+            return
+        out = []
+        if isinstance(owners, list):
+            for item in owners:
+                owner = item.get("owner")
+                out.append(f"<b>{html_escape(owner.get('name'))}</b>\nType: {html_escape(owner.get('type'))}\nID: <code>{html_escape(owner.get('id'))}</code>")
+        else:
+            out.append(html_escape(str(owners)))
+        await safe_edit(callback.message, "👤 Account / Owners:\n\n" + "\n\n".join(out), reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
 
-# ---------- private message handlers (create, pending flows, commands) ----------
-@app.on_message(filters.private & filters.text)
-async def private_text_handler(client: Client, message: Message):
-    txt = message.text.strip()
-    uid = message.from_user.id
+    # LIST APPS
+    if data == "list_apps":
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, svcs = await api.list_services(limit=50)
+        if not ok:
+            await safe_edit(callback.message, f"❌ Failed to list services.\n{svcs}", reply_markup=main_menu())
+            return
+        items = svcs if isinstance(svcs, list) else (svcs.get("services") if isinstance(svcs, dict) else [])
+        if not items:
+            await safe_edit(callback.message, "No services found.", reply_markup=main_menu())
+            return
+        rows = []
+        for s in items:
+            svc = s.get("service") if isinstance(s, dict) and "service" in s else s
+            sid = svc.get("id") if isinstance(svc, dict) else s.get("id")
+            name = svc.get("name") if isinstance(svc, dict) else str(s)
+            url = svc.get("defaultDomain") or (svc.get("serviceDetails") or {}).get("defaultDomain") or ""
+            label = f"📱 {name}" + (f" → {url}" if url else "")
+            rows.append([InlineKeyboardButton(label, callback_data=f"svc:{sid}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
+        await safe_edit(callback.message, "📋 <b>Your Services</b>:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        return
 
-    # /create, /setrepo, /login, /logs commands and pending flows
-    # Fully handled as per your original bot.py
-    # Safe API calls, error handling, state updates, HTML escape, etc.
+    # CREATE ROOT
+    if data == "create_root":
+        await safe_edit(callback.message, "Select a service type to create:", reply_markup=service_type_kb())
+        return
 
-# ---------- debug / helpers ----------
-@app.on_message(filters.command("dumpstate"))
-async def cmd_dumpstate(_, message: Message):
-    await message.reply_text(f"State keys: {list(state.keys())}\n\n{json.dumps(state, indent=2)[:3500]}")
+    # SERVICE TYPE selected
+    if data.startswith("create_type:"):
+        stype = data.split(":", 1)[1]
+        if stype not in VALID_SERVICE_TYPES:
+            await safe_edit(callback.message, "Invalid service type selected.", reply_markup=main_menu())
+            return
+        set_pending(uid, {"type": "create", "service_type": stype})
+        await safe_edit(callback.message,
+                        f"Selected <b>{html_escape(stype)}</b>.\nSend create details in private chat using:\n"
+                        "`/create <NAME> | <GIT_REPO optional> | <branch optional> | <startCommand optional>`",
+                        reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # REPO MAPPINGS
+    if data == "repo_mappings":
+        rows = []
+        for sid, info in state.get("repos", {}).items():
+            rows.append([InlineKeyboardButton(f"{sid} • {info.get('repo')}@{info.get('branch')}", callback_data=f"repo_info:{sid}")])
+        if not rows:
+            await safe_edit(callback.message, "No repo mappings stored.", reply_markup=main_menu())
+        else:
+            rows.append([InlineKeyboardButton("⬅️ Back", callback_data="account")])
+            await safe_edit(callback.message, "<b>Repo mappings</b>:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("repo_info:"):
+        sid = data.split(":", 1)[1]
+        mp = get_repo_mapping(sid)
+        if not mp:
+            await safe_edit(callback.message, "No mapping found.", reply_markup=main_menu())
+            return
+        txt = f"<b>Service {sid}</b>\nRepo: <code>{html_escape(mp.get('repo'))}</code>\nBranch: <code>{html_escape(mp.get('branch'))}</code>\nStart: <code>{html_escape(mp.get('startCommand'))}</code>"
+        await safe_edit(callback.message, txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="repo_mappings")]]), parse_mode=ParseMode.HTML)
+        return
+
+    # SERVICE entry
+    if data.startswith("svc:"):
+        sid = data.split(":", 1)[1]
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, svc = await api.get_service(sid)
+        if not ok:
+            await safe_edit(callback.message, f"❌ Could not fetch service:\n{svc}", reply_markup=main_menu())
+            return
+        service = svc.get("service") if isinstance(svc, dict) and "service" in svc else svc
+        name = service.get("name") if isinstance(service, dict) else str(service)
+        txt = f"<b>Service:</b> {html_escape(name)}\nID: <code>{html_escape(sid)}</code>"
+        await safe_edit(callback.message, txt, reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+        return
+
+    # SERVICE STATUS
+    if data.startswith("svc_status:"):
+        sid = data.split(":", 1)[1]
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, status = await api.get_status(sid)
+        if not ok:
+            await safe_edit(callback.message, f"❌ Could not get status:\n{status}", reply_markup=service_menu(sid))
+            return
+        txt = f"<b>Status for {sid}</b>\n" + json.dumps(status, indent=2)
+        await safe_edit(callback.message, txt, reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+        return
+
+    # SERVICE LOGS
+    if data.startswith("svc_logs:"):
+        try:
+            _, sid, page = data.split(":")
+            page = int(page)
+        except:
+            page = 1
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, logs = await api.get_logs(sid, page=page)
+        if not ok:
+            await safe_edit(callback.message, f"❌ Could not get logs:\n{logs}", reply_markup=service_menu(sid))
+            return
+        log_text = "\n".join(logs[:100]) if isinstance(logs, list) else str(logs)
+        await safe_edit(callback.message, f"<b>Logs page {page}</b>:\n<pre>{html_escape(log_text)}</pre>", reply_markup=logs_nav(sid, page), parse_mode=ParseMode.HTML)
+        return
+
+    # SERVICE RESTART
+    if data.startswith("svc_restart:"):
+        sid = data.split(":", 1)[1]
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        ok, res = await api.restart_service(sid)
+        msg = "✅ Restarted successfully." if ok else f"❌ Failed: {res}"
+        await safe_edit(callback.message, msg, reply_markup=service_menu(sid))
+        return
+
+    # SERVICE DEPLOY
+    if data.startswith("svc_deploy:"):
+        sid = data.split(":", 1)[1]
+        if not api:
+            await safe_edit(callback.message, "Please /login first.", reply_markup=main_menu())
+            return
+        repo = get_repo_mapping(sid)
+        if not repo:
+            await safe_edit(callback.message, "No repo mapping found. Set it first.", reply_markup=service_menu(sid))
+            return
+        ok, res = await api.deploy_service(sid, repo.get("repo"), repo.get("branch"), repo.get("startCommand"))
+        msg = "✅ Deployed successfully." if ok else f"❌ Deploy failed: {res}"
+        await safe_edit(callback.message, msg, reply_markup=service_menu(sid))
+        return
+
+    # SERVICE SET REPO
+    if data.startswith("svc_repo_set:"):
+        sid = data.split(":", 1)[1]
+        set_pending(uid, {"type": "set_repo", "service_id": sid})
+        await safe_edit(callback.message, f"Send repo info in private chat using:\n"
+                                          "`/setrepo <GIT_REPO> | <branch optional> | <startCommand optional>`",
+                        reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+        return
+
+    # SERVICE ENV
+    if data.startswith("svc_env:"):
+        sid = data.split(":", 1)[1]
+        set_pending(uid, {"type": "env", "service_id": sid})
+        await safe_edit(callback.message, f"Send env vars in private chat using:\n"
+                                          "`/env <KEY1>=<VAL1> | <KEY2>=<VAL2> ...`",
+                        reply_markup=service_menu(sid), parse_mode=ParseMode.HTML)
+        return
 
 
-# ---------- run ----------
+# ---------- PRIVATE MESSAGE HANDLERS ----------
+@app.on_message(filters.private & filters.command("create"))
+async def pm_create(_, message: Message):
+    pending = pop_pending(message.from_user.id)
+    api_key = get_user_key(message.from_user.id)
+    if not api_key:
+        await safe_reply(message, "Please /login first.")
+        return
+    if not pending or pending.get("type") != "create":
+        await safe_reply(message, "Start creation from inline menu /start → Create App.")
+        return
+    api = RenderAPI(api_key)
+    try:
+        parts = message.text.split(" ", 1)[1].split("|")
+        name = parts[0].strip()
+        repo = parts[1].strip() if len(parts) > 1 else None
+        branch = parts[2].strip() if len(parts) > 2 else "main"
+        startCommand = parts[3].strip() if len(parts) > 3 else None
+    except:
+        await safe_reply(message, "Invalid format. Use:\n`/create <NAME> | <GIT_REPO optional> | <branch optional> | <startCommand optional>`", parse_mode=ParseMode.HTML)
+        return
+    ok, svc = await api.create_service(pending["service_type"], name, repo, branch, startCommand)
+    if ok:
+        sid = svc.get("id") if isinstance(svc, dict) else str(svc)
+        await safe_reply(message, f"✅ Created service <b>{html_escape(name)}</b> with ID <code>{sid}</code>", parse_mode=ParseMode.HTML)
+    else:
+        await safe_reply(message, f"❌ Failed to create: {svc}")
+
+
+@app.on_message(filters.private & filters.command("setrepo"))
+async def pm_setrepo(_, message: Message):
+    pending = pop_pending(message.from_user.id)
+    if not pending or pending.get("type") != "set_repo":
+        await safe_reply(message, "Start from inline menu → Set Repo/Start")
+        return
+    sid = pending["service_id"]
+    try:
+        parts = message.text.split(" ", 1)[1].split("|")
+        repo = parts[0].strip()
+        branch = parts[1].strip() if len(parts) > 1 else "main"
+        startCommand = parts[2].strip() if len(parts) > 2 else None
+        set_repo_mapping(sid, repo, branch, startCommand)
+        await safe_reply(message, f"✅ Repo mapping saved for {sid}.")
+    except:
+        await safe_reply(message, "Invalid format. Use:\n`/setrepo <GIT_REPO> | <branch optional> | <startCommand optional>`", parse_mode=ParseMode.HTML)
+
+
+@app.on_message(filters.private & filters.command("env"))
+async def pm_env(_, message: Message):
+    pending = pop_pending(message.from_user.id)
+    if not pending or pending.get("type") != "env":
+        await safe_reply(message, "Start from inline menu → Env Vars")
+        return
+    sid = pending["service_id"]
+    api_key = get_user_key(message.from_user.id)
+    if not api_key:
+        await safe_reply(message, "Please /login first.")
+        return
+    api = RenderAPI(api_key)
+    try:
+        parts = message.text.split(" ", 1)[1].split("|")
+        env_vars = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.strip().split("=", 1)
+                env_vars[k.strip()] = v.strip()
+        ok, res = await api.set_env(sid, env_vars)
+        msg = "✅ Env vars set." if ok else f"❌ Failed: {res}"
+        await safe_reply(message, msg)
+    except:
+        await safe_reply(message, "Invalid format. Use:\n`/env <KEY1>=<VAL1> | <KEY2>=<VAL2>`", parse_mode=ParseMode.HTML)
+
+
+# ---------- START ----------
 if __name__ == "__main__":
-    print("🤖 Render Manager Bot starting...")
+    logger.info("Starting Render Manager Bot...")
     app.run()
